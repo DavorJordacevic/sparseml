@@ -19,7 +19,8 @@ PyTorch version must support quantization (>=1.2, ONNX export support introduced
 """
 
 
-from typing import Any, Dict, List, Optional, Union
+import logging
+from typing import Any, Dict, Iterable, List, Optional, Union
 
 from torch.nn import Module
 from torch.optim.optimizer import Optimizer
@@ -34,7 +35,7 @@ except Exception:
 
 from sparseml.optim import ModifierProp
 from sparseml.pytorch.optim.modifier import PyTorchModifierYAML, ScheduledModifier
-from sparseml.pytorch.utils import BaseLogger
+from sparseml.pytorch.utils import BaseLogger, tensors_module_forward
 from sparseml.pytorch.utils.quantization import (
     add_quant_dequant,
     configure_module_default_qconfigs,
@@ -43,6 +44,9 @@ from sparseml.pytorch.utils.quantization import (
     get_qat_qconfig,
     prepare_embeddings_qat,
 )
+
+
+_LOGGER = logging.getLogger(__name__)
 
 
 __all__ = [
@@ -124,6 +128,7 @@ class QuantizationModifier(ScheduledModifier):
         self._qat_enabled = False
         self._quantization_observer_disabled = False
         self._bn_stats_frozen = False
+        self._calibration_dataloader = None
 
         if (
             isinstance(self._model_fuse_fn_name, str)
@@ -238,6 +243,7 @@ class QuantizationModifier(ScheduledModifier):
         module: Module,
         epoch: float = 0,
         loggers: Optional[List[BaseLogger]] = None,
+        calibration_dataloader: Optional[Iterable] = None,
         **kwargs,
     ):
         """
@@ -247,11 +253,15 @@ class QuantizationModifier(ScheduledModifier):
         :param epoch: The epoch to initialize the modifier and module at.
             Defaults to 0 (start of the training process)
         :param loggers: Optional list of loggers to log the modification process to
+        :param calibration_dataloader: optional dataloader for running post training
+            quantization with the given model. if present, calibration will be run
+            immediately after quantization is enabled
         :param kwargs: Optional kwargs to support specific arguments
             for individual modifiers.
         """
         super().initialize(module, epoch, loggers, **kwargs)
         self._modules_to_quantize = []
+        self._calibration_dataloader = calibration_dataloader
         if self._submodules is not None:
             found_submodules = []
             for name, submodule in module.named_modules():
@@ -378,6 +388,19 @@ class QuantizationModifier(ScheduledModifier):
             if self._quantize_embeddings:
                 prepare_embeddings_qat(quant_module)
         self._qat_enabled = True
+
+        if self._calibration_dataloader is not None:
+            self._calibrate(module)
+
+    def _calibrate(self, module):
+        if not self._calibration_dataloader or not self._qat_enabled:
+            return
+
+        _LOGGER.info("Calibrating module for static quantization")
+        module.eval()
+        module.apply(torch_intrinsic.qat.freeze_bn_stats)
+        for batch in self._calibration_dataloader:
+            tensors_module_forward(batch, module)
 
     def _disable_quantization_observer_update_ready(self, epoch: float) -> bool:
         return (
